@@ -66,6 +66,7 @@ export default function Shell({ me, group, welcome, clearWelcome, onSwitchGroup,
     gid,
     me: info.me,
     isManager: info.me.role === 'manager',
+    isOwner: !!info.me.isOwner,
     members: info.members,
     workers: info.members.filter((m) => m.role === 'worker'),
     groupInfo: info.group,
@@ -82,7 +83,7 @@ export default function Shell({ me, group, welcome, clearWelcome, onSwitchGroup,
       <header className="topbar">
         <button className="group-switch" onClick={() => setPanel(panel === 'menu' ? null : 'menu')} aria-haspopup="menu">
           <span className="group-name">{group.name}</span>
-          <span className="role-tag">{ctx.isManager ? 'Manager' : info.me.name}</span>
+          <span className="role-tag">{ctx.isOwner ? 'Owner' : ctx.isManager ? 'Manager' : info.me.name}</span>
           <span className="caret" aria-hidden>▾</span>
         </button>
         <button className="icon-btn bell" onClick={() => setPanel(panel === 'notifications' ? null : 'notifications')} aria-label={`Notifications${pulse.unread ? `, ${pulse.unread} unread` : ''}`}>

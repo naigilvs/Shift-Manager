@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   api, ymd, addDays, startOfWeek, parseDay, todayStr, nowLocal, fmtMonth, timeOf, SHORT_DAYS, fmtDayLong,
 } from './lib.js';
-import ShiftDialog from './ShiftDialog.jsx';
+import ShiftDialog, { bulkSummary } from './ShiftDialog.jsx';
+import { Modal, ErrorBox } from './ui.jsx';
 
 const VIEW_KEY = 'sm.calView';
 
@@ -12,6 +13,8 @@ export default function Calendar({ ctx }) {
   const [shifts, setShifts] = useState(null);
   const [filter, setFilter] = useState('all'); // 'all' | 'mine' | memberId
   const [dialog, setDialog] = useState(null); // { shift } | { newOn: 'YYYY-MM-DD' }
+  const [copyOpen, setCopyOpen] = useState(false);
+  const [notice, setNotice] = useState(null); // { text, details: [] } after a bulk action
 
   const range = useMemo(() => {
     if (view === 'week') {
@@ -72,6 +75,7 @@ export default function Calendar({ ctx }) {
             <button className={view === 'week' ? 'on' : ''} onClick={() => setViewSaved('week')}>Week</button>
             <button className={view === 'month' ? 'on' : ''} onClick={() => setViewSaved('month')}>Month</button>
           </div>
+          {ctx.isManager && view === 'week' && <button className="btn btn-sm" onClick={() => setCopyOpen(true)}>Copy last week</button>}
           {ctx.isManager && <button className="btn btn-primary btn-sm" onClick={() => setDialog({ newOn: todayStr() })}>＋ Shift</button>}
         </div>
       </div>
@@ -80,6 +84,21 @@ export default function Calendar({ ctx }) {
         <div className="alert alert-warn">
           You have {pendingForMe.length} shift{pendingForMe.length > 1 ? 's' : ''} outside your usual availability waiting for your answer.{' '}
           <button className="link" onClick={() => setDialog({ shift: pendingForMe[0] })}>Review</button>
+        </div>
+      )}
+
+      {notice && (
+        <div className="alert alert-ok notice">
+          <div className="notice-row">
+            <span>{notice.text}</span>
+            <button className="icon-btn" aria-label="Dismiss" onClick={() => setNotice(null)}>✕</button>
+          </div>
+          {notice.details?.length > 0 && (
+            <details>
+              <summary>Show skipped shifts</summary>
+              <ul>{notice.details.map((d, i) => <li key={i}>{d}</li>)}</ul>
+            </details>
+          )}
         </div>
       )}
 
@@ -96,7 +115,16 @@ export default function Calendar({ ctx }) {
           shift={dialog.shift}
           newOn={dialog.newOn}
           onClose={() => setDialog(null)}
-          onDone={() => { setDialog(null); ctx.bump(); }}
+          onDone={(text, details) => { setDialog(null); setNotice(text ? { text, details } : null); ctx.bump(); }}
+        />
+      )}
+
+      {copyOpen && (
+        <CopyWeekDialog
+          ctx={ctx}
+          to={range.from}
+          onClose={() => setCopyOpen(false)}
+          onDone={(r) => { setCopyOpen(false); setNotice({ text: bulkSummary(r), details: r.skipped }); ctx.bump(); }}
         />
       )}
     </div>
@@ -182,5 +210,40 @@ function Legend({ ctx }) {
       ))}
       <span className="legend-item"><span className="dot dashed" />Open shift</span>
     </div>
+  );
+}
+
+function CopyWeekDialog({ ctx, to, onClose, onDone }) {
+  const from = addDays(to, -7);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const label = (d) => `${d.getDate()} ${SHORT_MONTH(d)}`;
+  const go = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      onDone(await api('POST', `/groups/${ctx.gid}/shifts/copy-week`, { from: ymd(from), to: ymd(to) }));
+    } catch (e) { setError(e.message); setBusy(false); }
+  };
+  return (
+    <Modal
+      title="Copy last week"
+      onClose={onClose}
+      footer={<>
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-primary" disabled={busy} onClick={go}>{busy ? 'Copying…' : 'Copy shifts'}</button>
+      </>}
+    >
+      <p>
+        Copy every shift from <b>{label(from)} – {label(addDays(from, 6))}</b> into
+        {' '}<b>{label(to)} – {label(addDays(to, 6))}</b>, on the same days and times.
+      </p>
+      <ul className="small muted bullets">
+        <li>Days that have already passed are skipped.</li>
+        <li>Shifts that are already on the schedule, or would double-book someone, are skipped.</li>
+        <li>If a shift is now outside someone's availability, they're asked to accept it.</li>
+      </ul>
+      <ErrorBox error={error} />
+    </Modal>
   );
 }

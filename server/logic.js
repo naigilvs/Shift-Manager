@@ -43,6 +43,10 @@ function toUTC(dt) {
   const [h, mi] = t.split(':').map(Number);
   return Date.UTC(y, m - 1, day, h, mi);
 }
+export function addDaysDT(dt, n) {
+  const d = new Date(toUTC(dt) + n * 86400000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
 export const minutesBetween = (a, b) => (toUTC(b) - toUTC(a)) / 60000;
 export const weekdayOf = (dt) => new Date(toUTC(dt)).getUTCDay();
 

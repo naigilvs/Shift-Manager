@@ -104,6 +104,14 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_conv ON messages(group_id, conv, id);
 `);
 
+// ---- migrations for databases created by earlier versions ----
+const memberCols = db.prepare('PRAGMA table_info(members)').all().map((c) => c.name);
+if (!memberCols.includes('is_owner')) {
+  // The owner is the person who created the group; other managers are co-managers.
+  db.exec("ALTER TABLE members ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0");
+  db.exec("UPDATE members SET is_owner = 1 WHERE role = 'manager'");
+}
+
 export const one = (sql, ...p) => db.prepare(sql).get(...p);
 export const all = (sql, ...p) => db.prepare(sql).all(...p);
 export const run = (sql, ...p) => db.prepare(sql).run(...p);
