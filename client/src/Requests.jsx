@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api, fmtRange, timeAgo } from './lib.js';
 import { Empty, ErrorBox } from './ui.jsx';
 
-const TYPE_LABEL = { change: 'Shift change', drop: 'Drop shift', trade: 'Shift trade', accept_shift: 'Shift outside availability' };
+const TYPE_LABEL = { change: 'Shift change', drop: 'Drop shift', trade: 'Shift trade', accept_shift: 'Shift outside availability', pickup: 'Pick up open shift' };
 const STATUS_LABEL = { pending: 'Pending', approved: 'Approved', declined: 'Declined', cancelled: 'Cancelled' };
 
 export default function Requests({ ctx }) {
@@ -17,7 +17,7 @@ export default function Requests({ ctx }) {
   if (!list) return error ? <ErrorBox error={error} /> : <div className="spinner" />;
 
   const mine = ctx.me.id;
-  const needsMe = (r) => r.status === 'pending' && (ctx.isManager ? ['change', 'drop'].includes(r.type) : r.toMemberId === mine);
+  const needsMe = (r) => r.status === 'pending' && (ctx.isManager ? ['change', 'drop', 'pickup'].includes(r.type) : r.toMemberId === mine);
   const answer = list.filter(needsMe);
   const sent = list.filter((r) => r.status === 'pending' && r.fromMemberId === mine && r.type !== 'accept_shift');
   const watching = list.filter((r) => r.status === 'pending' && !needsMe(r) && r.fromMemberId !== mine);
@@ -35,7 +35,7 @@ export default function Requests({ ctx }) {
   return (
     <div className="requests">
       <ErrorBox error={error} />
-      <Section title="Needs your answer" empty={ctx.isManager ? 'No change or drop requests waiting.' : 'Nothing waiting on you.'}>
+      <Section title="Needs your answer" empty={ctx.isManager ? 'No change, drop or pick-up requests waiting.' : 'Nothing waiting on you.'}>
         {answer.map((r) => (
           <RequestCard key={r.id} r={r} ctx={ctx}>
             <button className="btn btn-danger-ghost btn-sm" disabled={busyId === r.id} onClick={() => act(r, 'respond', { action: 'decline' })}>Decline</button>
@@ -95,6 +95,8 @@ function RequestCard({ r, ctx, children }) {
     text = <>{you(r.fromMemberId, r.fromName)} asked to move {r.shift ? <b>{fmtRange(r.shift)}</b> : 'a shift'} to <b>{fmtRange({ start: r.proposedStart, end: r.proposedEnd })}</b>.</>;
   } else if (r.type === 'drop') {
     text = <>{you(r.fromMemberId, r.fromName)} asked to drop {r.shift ? <b>{fmtRange(r.shift)}</b> : 'a shift'}.</>;
+  } else if (r.type === 'pickup') {
+    text = <>{you(r.fromMemberId, r.fromName)} asked to pick up the open shift {r.shift ? <b>{fmtRange(r.shift)}</b> : ''}.</>;
   } else if (r.type === 'trade') {
     text = r.offerShift
       ? <>{you(r.fromMemberId, r.fromName)} offered <b>{fmtRange(r.offerShift)}</b> in exchange for {r.toMemberId === ctx.me.id ? 'your' : `${r.toName}'s`} shift <b>{r.shift ? fmtRange(r.shift) : ''}</b>.</>

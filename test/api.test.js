@@ -128,3 +128,75 @@ test('full workflow', async () => {
   assert.equal(hist.length, 1);
   assert.equal(hist[0].memberName, 'Ben');
 });
+
+// Monday of the week `weeksAhead` from now, as 'YYYY-MM-DD'.
+function monday(weeksAhead) {
+  const d = new Date();
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7) + 7 * weeksAhead);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+const plus = (ymd, n) => { const [y, m, d] = ymd.split('-').map(Number); const x = new Date(y, m - 1, d + n); return `${x.getFullYear()}-${pad(x.getMonth() + 1)}-${pad(x.getDate())}`; };
+
+test('co-managers, repeating shifts, copy week, open shift pick-up', async () => {
+  const own = (await call(null, 'POST', '/auth/enter', { name: 'Olu', phone: '5552000001', password: 'pass1' })).body.token;
+  const g = (await call(own, 'POST', '/groups', { name: 'Bakery' })).body;
+  const gp = `/groups/${g.id}`;
+  const join = async (name, phone) => {
+    const t = (await call(null, 'POST', '/auth/enter', { name, phone, password: 'pass1' })).body.token;
+    await call(t, 'POST', '/groups/join', { code: g.code });
+    return t;
+  };
+  const cm = await join('Cam', '5552000002');
+  const wk = await join('Wes', '5552000003');
+  const wk2 = await join('Vi', '5552000004');
+  const members = (await call(own, 'GET', gp)).body.members;
+  const id = (n) => members.find((m) => m.name === n).id;
+  assert.equal(members.find((m) => m.name === 'Olu').isOwner, true);
+
+  // Only the owner can promote; promoting Cam gives them manager powers.
+  assert.equal((await call(wk, 'PUT', `${gp}/members/${id('Cam')}/role`, { role: 'manager' })).status, 403);
+  assert.equal((await call(own, 'PUT', `${gp}/members/${id('Cam')}/role`, { role: 'manager' })).status, 200);
+  const camMe = (await call(cm, 'GET', gp)).body;
+  assert.equal(camMe.me.role, 'manager');
+  assert.ok(camMe.group.code, 'co-manager sees the join code');
+  assert.equal((await call(cm, 'POST', `${gp}/messages`, { conv: 'team', body: 'hi' })).status, 403, 'co-manager is read-only in chat');
+  assert.equal((await call(cm, 'DELETE', `${gp}/members/${id('Olu')}`)).status, 400, 'owner cannot be removed');
+
+  // Co-manager schedules Wes every Monday for 3 weeks; one of those Mondays is already taken -> skipped.
+  const m1 = monday(1);
+  await call(own, 'POST', `${gp}/shifts`, { memberId: id('Wes'), start: `${plus(m1, 14)}T10:00`, end: `${plus(m1, 14)}T12:00` });
+  const rep = (await call(cm, 'POST', `${gp}/shifts`, { memberId: id('Wes'), start: `${m1}T09:00`, end: `${m1}T17:00`, repeatWeeks: 3 })).body;
+  assert.equal(rep.created, 2);
+  assert.equal(rep.skipped.length, 1);
+  assert.match(rep.skipped[0], /overlaps/);
+
+  // Copy week 1 into week 4: the Monday shift is copied; copying again is a no-op.
+  const copy = (await call(own, 'POST', `${gp}/shifts/copy-week`, { from: m1, to: monday(4) })).body;
+  assert.equal(copy.created, 1);
+  const again = (await call(own, 'POST', `${gp}/shifts/copy-week`, { from: m1, to: monday(4) })).body;
+  assert.equal(again.created, 0);
+  assert.match(again.skipped[0], /already on the schedule/);
+  assert.equal((await call(wk, 'POST', `${gp}/shifts/copy-week`, { from: m1, to: monday(5) })).status, 403);
+
+  // Open shift: Vi asks to pick it up; the co-manager approves.
+  const d = plus(m1, 2);
+  const open = (await call(own, 'POST', `${gp}/shifts`, { memberId: null, start: `${d}T08:00`, end: `${d}T12:00` })).body;
+  assert.equal(open.status, 'open');
+  assert.equal((await call(wk2, 'POST', `${gp}/requests`, { type: 'pickup', shiftId: open.id })).status, 200);
+  assert.equal((await call(wk, 'POST', `${gp}/requests`, { type: 'pickup', shiftId: open.id })).status, 200);
+  const pickups = (await call(cm, 'GET', `${gp}/requests`)).body.filter((r) => r.type === 'pickup');
+  const vis = pickups.find((r) => r.fromMemberId === id('Vi'));
+  assert.equal((await call(cm, 'POST', `${gp}/requests/${vis.id}/respond`, { action: 'approve' })).status, 200);
+  const filled = (await call(own, 'GET', `${gp}/shifts`)).body.find((s) => s.id === open.id);
+  assert.equal(filled.memberId, id('Vi'));
+  assert.equal(filled.status, 'assigned');
+  const wesReq = (await call(wk, 'GET', `${gp}/requests`)).body.find((r) => r.type === 'pickup');
+  assert.equal(wesReq.status, 'cancelled', "the other pick-up request is closed once it's filled");
+  // Both managers were notified of the pick-up requests.
+  assert.ok((await call(own, 'GET', `${gp}/notifications`)).body.some((n) => /pick up/.test(n.text)));
+  assert.ok((await call(cm, 'GET', `${gp}/notifications`)).body.some((n) => /pick up/.test(n.text)));
+
+  // Demoting back to worker.
+  assert.equal((await call(own, 'PUT', `${gp}/members/${id('Cam')}/role`, { role: 'worker' })).status, 200);
+  assert.equal((await call(cm, 'POST', `${gp}/shifts`, { memberId: null, start: `${d}T13:00`, end: `${d}T14:00` })).status, 403);
+});

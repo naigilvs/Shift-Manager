@@ -11,11 +11,46 @@ export default function ShiftDialog({ ctx, shift, newOn, onClose, onDone }) {
   if (mine && shift.status === 'pending') return <AcceptDialog ctx={ctx} shift={shift} onClose={onClose} onDone={onDone} />;
   if (!past && mine && shift.status === 'assigned') return <MyShiftDialog ctx={ctx} shift={shift} onClose={onClose} onDone={onDone} />;
   if (!past && !mine && shift.status === 'assigned') return <TradeDialog ctx={ctx} shift={shift} onClose={onClose} onDone={onDone} />;
+  if (!past && shift.status === 'open') return <PickupDialog ctx={ctx} shift={shift} onClose={onClose} onDone={onDone} />;
   return (
     <Modal title="Shift details" onClose={onClose} footer={<button className="btn" onClick={onClose}>Close</button>}>
       <ShiftSummary shift={shift} />
       {past && <p className="muted small">This shift has already started, so it can't be changed.</p>}
-      {shift.status === 'open' && <p className="muted small">This shift has no one assigned yet. Ask your manager if you'd like to pick it up.</p>}
+    </Modal>
+  );
+}
+
+// ---------- worker: open shift → ask to pick it up ----------
+function PickupDialog({ ctx, shift, onClose, onDone }) {
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const already = myPending(ctx, shift, 'pickup');
+  const send = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await api('POST', `/groups/${ctx.gid}/requests`, { type: 'pickup', shiftId: shift.id, message });
+      onDone('Pick-up request sent. You\'ll be notified when a manager answers.');
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  };
+  return (
+    <Modal
+      title="Open shift"
+      onClose={onClose}
+      footer={<>
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-primary" disabled={busy || !!already} onClick={send}>Ask to pick up</button>
+      </>}
+    >
+      <ShiftSummary shift={shift} />
+      {already ? <div className="alert alert-info">You've already asked to pick up this shift. You'll be notified when a manager answers.</div> : (
+        <>
+          <p className="small">No one is working this shift yet. Ask to pick it up and a manager will approve or decline.</p>
+          <Field label="Message (optional)"><textarea rows={2} value={message} onChange={(e) => setMessage(e.target.value)} /></Field>
+        </>
+      )}
+      <ErrorBox error={error} />
     </Modal>
   );
 }
@@ -220,6 +255,7 @@ function ShiftEditor({ ctx, shift, newOn, onClose, onDone }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [repeat, setRepeat] = useState(1);
 
   const worker = ctx.workers.find((w) => String(w.id) === memberId);
   const wd = date ? parseDay(date).getDay() : 0;
@@ -230,9 +266,9 @@ function ShiftEditor({ ctx, shift, newOn, onClose, onDone }) {
     setError('');
     try {
       const body = { memberId: memberId ? Number(memberId) : null, ...buildRange(date, st, et), note, sendAsRequest };
-      if (shift) await api('PUT', `/groups/${ctx.gid}/shifts/${shift.id}`, body);
-      else await api('POST', `/groups/${ctx.gid}/shifts`, body);
-      onDone();
+      if (shift) { await api('PUT', `/groups/${ctx.gid}/shifts/${shift.id}`, body); onDone(); return; }
+      const r = await api('POST', `/groups/${ctx.gid}/shifts`, { ...body, repeatWeeks: repeat });
+      onDone(repeat > 1 ? bulkSummary(r) : null, r.skipped);
     } catch (e) {
       if (e.status === 409 && e.body.conflict) setConflict(e.body);
       else setError(e.message);
@@ -298,10 +334,26 @@ function ShiftEditor({ ctx, shift, newOn, onClose, onDone }) {
           <Field label="Start"><input type="time" value={st} onChange={(e) => setSt(e.target.value)} /></Field>
           <Field label="End" hint={et <= st ? 'Ends the next day' : null}><input type="time" value={et} onChange={(e) => setEt(e.target.value)} /></Field>
         </div>
+        {!shift && (
+          <Field label="Repeat">
+            <select value={repeat} onChange={(e) => setRepeat(Number(e.target.value))}>
+              <option value={1}>Doesn't repeat</option>
+              {[2, 3, 4, 6, 8, 12].map((n) => <option key={n} value={n}>Every {DAYS[wd]} for {n} weeks</option>)}
+            </select>
+          </Field>
+        )}
         <Field label="Note (optional)"><input value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. Opening, register 2" maxLength={300} /></Field>
         {ctx.workers.length === 0 && <p className="muted small">No workers yet — add people from the Team tab. You can still create open shifts.</p>}
       </div>
       <ErrorBox error={error} />
     </Modal>
   );
+}
+
+/** One-line summary of a bulk create (repeat or copy week). */
+export function bulkSummary(r) {
+  const parts = [`Added ${r.created} shift${r.created === 1 ? '' : 's'}`];
+  if (r.pending) parts.push(`${r.pending} waiting for the worker to accept (outside availability)`);
+  if (r.skipped.length) parts.push(`${r.skipped.length} skipped`);
+  return parts.join(' · ') + '.';
 }

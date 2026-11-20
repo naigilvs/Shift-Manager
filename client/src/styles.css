@@ -386,3 +386,11 @@ textarea { resize: vertical; }
 .avail-slots > .muted { padding-top: 5px; }
 .avail-slot { display: flex; align-items: center; gap: 6px; }
 .avail-slot input { width: 136px; padding: 6px 8px; }
+
+.notice { margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px; }
+.notice-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.notice .icon-btn { height: 26px; min-width: 26px; color: inherit; }
+.notice summary { cursor: pointer; font-weight: 600; font-size: 0.85rem; }
+.notice ul, .bullets { margin: 6px 0 0; padding-left: 18px; }
+.pill-owner { background: var(--ok-soft); color: var(--ok); }
+.member-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }

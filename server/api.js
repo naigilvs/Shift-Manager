@@ -2,7 +2,7 @@ import express from 'express';
 import { one, all, run, tx } from './db.js';
 import {
   COLORS, normPhone, hashPassword, checkPassword, newToken, newCode, nowLocal,
-  validateShiftTimes, fmtShift, availabilityIssue, isTime,
+  validateShiftTimes, fmtShift, availabilityIssue, isTime, addDaysDT, minutesBetween, weekdayOf, DAYS,
 } from './logic.js';
 
 export const api = express.Router();
@@ -117,7 +117,7 @@ api.post('/groups', auth, h((req) => {
     const g = run('INSERT INTO groups (name, code) VALUES (?, ?)', name, code);
     const gid = Number(g.lastInsertRowid);
     run(
-      `INSERT INTO members (group_id, user_id, name, phone, role, color, joined_at) VALUES (?, ?, ?, ?, 'manager', ?, ?)`,
+      `INSERT INTO members (group_id, user_id, name, phone, role, color, joined_at, is_owner) VALUES (?, ?, ?, ?, 'manager', ?, ?, 1)`,
       gid, req.user.id, req.user.name, req.user.phone, '#475569', nowLocal(),
     );
     for (const inv of invites) {
@@ -160,6 +160,7 @@ api.use('/groups/:gid', auth, (req, res, next) => {
   req.member = m;
   req.gid = m.group_id;
   req.isManager = m.role === 'manager';
+  req.isOwner = !!m.is_owner;
   next();
 }, group);
 
@@ -179,10 +180,11 @@ const slotsFor = (memberId) => all('SELECT weekday, start, end FROM availability
 group.get('/', h((req) => {
   const g = one('SELECT id, name, code FROM groups WHERE id = ?', req.gid);
   const members = all(
-    `SELECT id, name, phone, role, color, user_id IS NOT NULL AS joined FROM members
-     WHERE group_id = ? AND active = 1 ORDER BY role = 'manager' DESC, name COLLATE NOCASE`, req.gid,
-  ).map((m) => ({
+    `SELECT id, name, phone, role, color, is_owner, user_id IS NOT NULL AS joined FROM members
+     WHERE group_id = ? AND active = 1 ORDER BY is_owner DESC, role = 'manager' DESC, name COLLATE NOCASE`, req.gid,
+  ).map(({ is_owner: owner, ...m }) => ({
     ...m,
+    isOwner: !!owner,
     joined: !!m.joined,
     phone: req.isManager || m.id === req.member.id ? m.phone : undefined,
     availability: slotsFor(m.id),
@@ -190,7 +192,7 @@ group.get('/', h((req) => {
   }));
   return {
     group: { id: g.id, name: g.name, code: req.isManager ? g.code : undefined },
-    me: { id: req.member.id, role: req.member.role, name: req.member.name },
+    me: { id: req.member.id, role: req.member.role, name: req.member.name, isOwner: req.isOwner },
     members,
   };
 }));
@@ -205,13 +207,42 @@ group.delete('/members/:mid', h((req) => {
   requireManager(req);
   const m = one('SELECT * FROM members WHERE id = ? AND group_id = ?', Number(req.params.mid), req.gid);
   if (!m) fail(404, 'Member not found.');
-  if (m.role === 'manager') fail(400, 'The manager cannot be removed.');
+  if (m.is_owner) fail(400, 'The group owner cannot be removed.');
+  if (m.role === 'manager' && !req.isOwner) fail(403, 'Only the group owner can remove a manager.');
   tx(() => {
     run('UPDATE members SET active = 0 WHERE id = ?', m.id);
     // Their upcoming shifts become open so the manager can reassign them.
     run("UPDATE shifts SET member_id = NULL, status = 'open', updated_at = datetime('now') WHERE member_id = ? AND start > ?", m.id, nowLocal());
-    run("UPDATE requests SET status = 'cancelled', resolved_at = datetime('now') WHERE status = 'pending' AND (from_member_id = ? OR to_member_id = ?)", m.id, m.id);
+    // A manager's "please accept this shift" requests stay open: they belong to the shift, not the manager.
+    run(
+      `UPDATE requests SET status = 'cancelled', resolved_at = datetime('now')
+       WHERE status = 'pending' AND ((from_member_id = ? AND type != 'accept_shift') OR to_member_id = ?)`, m.id, m.id,
+    );
   });
+}));
+
+// Owner only: make a worker a co-manager, or a co-manager a worker again.
+group.put('/members/:mid/role', h((req) => {
+  if (!req.isOwner) fail(403, 'Only the group owner can change who is a manager.');
+  const role = req.body.role;
+  if (role !== 'manager' && role !== 'worker') fail(400, 'Role must be manager or worker.');
+  const m = one('SELECT * FROM members WHERE id = ? AND group_id = ? AND active = 1', Number(req.params.mid), req.gid);
+  if (!m) fail(404, 'Member not found.');
+  if (m.is_owner) fail(400, "The owner's role can't be changed.");
+  if (m.role === role) return { role };
+  const g = one('SELECT name FROM groups WHERE id = ?', req.gid);
+  tx(() => {
+    run('UPDATE members SET role = ? WHERE id = ?', role, m.id);
+    if (role === 'manager') {
+      // Managers don't work shifts: their upcoming shifts become open, and their open requests are cancelled.
+      run("UPDATE shifts SET member_id = NULL, status = 'open', updated_at = datetime('now') WHERE member_id = ? AND start > ?", m.id, nowLocal());
+      run("UPDATE requests SET status = 'cancelled', resolved_at = datetime('now') WHERE status = 'pending' AND (from_member_id = ? OR to_member_id = ?)", m.id, m.id);
+      notify(m.id, `You're now a manager of ${g.name}. You can create and edit shifts and answer requests.`, 'calendar');
+    } else {
+      notify(m.id, `You're now a worker in ${g.name}.`, 'calendar');
+    }
+  });
+  return { role };
 }));
 
 group.post('/code', h((req) => {
@@ -302,24 +333,100 @@ function createAcceptRequest(req, shiftId, memberId, start, end) {
   notify(memberId, `${req.member.name} asked if you can work ${fmtShift({ start, end })}. It's outside your usual availability — please accept or decline.`);
 }
 
+/**
+ * Insert one shift for a manager. With `skipOverlap`, a double-booking is returned as a skip
+ * instead of failing, so bulk actions (repeat, copy week) can carry on with the rest.
+ */
+function insertShift(req, { memberId, start, end, note }, { sendAsRequest, skipOverlap = false, notifyWorker = true }) {
+  let status = 'open';
+  if (memberId != null) {
+    const m = one('SELECT * FROM members WHERE id = ? AND group_id = ? AND active = 1', memberId, req.gid);
+    if (!m || m.role !== 'worker') {
+      if (skipOverlap) return { skipped: `${fmtShift({ start, end })}: ${m ? m.name : 'that person'} is no longer a worker in this group.` };
+      fail(400, m ? 'Shifts can only be assigned to workers.' : 'That worker is not in this group.');
+    }
+    const o = overlapping(m.id, start, end);
+    if (o) {
+      const msg = `${m.name} already has a shift on ${fmtShift(o)} that overlaps.`;
+      if (skipOverlap) return { skipped: `${fmtShift({ start, end })}: ${msg}` };
+      fail(409, msg);
+    }
+    const issue = availabilityIssue(slotsFor(m.id), m.name, start, end);
+    if (issue && !sendAsRequest) fail(409, issue, { conflict: true, issue, workerName: m.name });
+    status = issue ? 'pending' : 'assigned';
+  }
+  const r = run(
+    'INSERT INTO shifts (group_id, member_id, start, end, note, status) VALUES (?, ?, ?, ?, ?, ?)',
+    req.gid, memberId, start, end, str(note, 300), status,
+  );
+  const id = Number(r.lastInsertRowid);
+  if (status === 'pending') createAcceptRequest(req, id, memberId, start, end);
+  // Shifts entered after the fact (to record past work) don't need a notification.
+  else if (status === 'assigned' && notifyWorker && end > nowLocal()) notify(memberId, `New shift: ${fmtShift({ start, end })}.`, 'calendar');
+  return { id, status };
+}
+
 group.post('/shifts', h((req) => {
   requireManager(req);
-  const { start, end } = req.body;
+  const { start, end, note } = req.body;
   const memberId = req.body.memberId ? Number(req.body.memberId) : null;
   const err = validateShiftTimes(start, end);
   if (err) fail(400, err);
-  const status = checkAssignment(req, memberId, start, end);
+  const weeks = Math.min(12, Math.max(1, Math.floor(Number(req.body.repeatWeeks) || 1)));
+  const sendAsRequest = !!req.body.sendAsRequest;
   return tx(() => {
-    const r = run(
-      'INSERT INTO shifts (group_id, member_id, start, end, note, status) VALUES (?, ?, ?, ?, ?, ?)',
-      req.gid, memberId, start, end, str(req.body.note, 300), status,
-    );
-    const id = Number(r.lastInsertRowid);
-    if (status === 'pending') createAcceptRequest(req, id, memberId, start, end);
-    // Shifts entered after the fact (to record past work) don't need a notification.
-    else if (status === 'assigned' && end > nowLocal()) notify(memberId, `New shift: ${fmtShift({ start, end })}.`, 'calendar');
-    return { id, status };
+    // The first shift must succeed (errors and the availability warning go back to the manager);
+    // later repeats that would double-book someone are skipped and reported.
+    const first = insertShift(req, { memberId, start, end, note }, { sendAsRequest, notifyWorker: weeks === 1 });
+    const result = { id: first.id, status: first.status, created: 1, pending: first.status === 'pending' ? 1 : 0, skipped: [] };
+    for (let k = 1; k < weeks; k++) {
+      const r = insertShift(req, { memberId, start: addDaysDT(start, 7 * k), end: addDaysDT(end, 7 * k), note }, { sendAsRequest, skipOverlap: true, notifyWorker: false });
+      if (r.skipped) result.skipped.push(r.skipped);
+      else { result.created++; if (r.status === 'pending') result.pending++; }
+    }
+    const assigned = result.created - result.pending;
+    if (weeks > 1 && memberId && assigned > 0) {
+      notify(memberId, `New shifts: ${DAYS[weekdayOf(start)]}s ${start.slice(11)}–${end.slice(11)}, ${assigned} week${assigned > 1 ? 's' : ''} starting ${fmtShift({ start, end }).split(',')[0]}.`, 'calendar');
+    }
+    return result;
   });
+}));
+
+// Copy every shift from one week (Mon–Sun) into another, keeping the same weekdays and times.
+group.post('/shifts/copy-week', h((req) => {
+  requireManager(req);
+  const { from, to } = req.body;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '')) fail(400, 'Pick the weeks to copy from and to.');
+  const delta = Math.round(minutesBetween(`${from}T00:00`, `${to}T00:00`) / 1440);
+  if (delta === 0) fail(400, 'Pick a different week to copy into.');
+  const source = all(
+    "SELECT * FROM shifts WHERE group_id = ? AND start >= ? AND start < ? ORDER BY start",
+    req.gid, `${from}T00:00`, `${addDaysDT(`${from}T00:00`, 7)}`,
+  );
+  if (!source.length) fail(400, 'There are no shifts in that week to copy.');
+  const now = nowLocal();
+  const result = { created: 0, pending: 0, skipped: [] };
+  const perWorker = new Map();
+  tx(() => {
+    for (const s of source) {
+      const start = addDaysDT(s.start, delta);
+      const end = addDaysDT(s.end, delta);
+      if (start <= now) { result.skipped.push(`${fmtShift({ start, end })}: already started.`); continue; }
+      const dupe = one(
+        'SELECT 1 FROM shifts WHERE group_id = ? AND start = ? AND end = ? AND member_id IS ?', req.gid, start, end, s.member_id,
+      );
+      if (dupe) { result.skipped.push(`${fmtShift({ start, end })}: already on the schedule.`); continue; }
+      const r = insertShift(req, { memberId: s.member_id, start, end, note: s.note }, { sendAsRequest: true, skipOverlap: true, notifyWorker: false });
+      if (r.skipped) { result.skipped.push(r.skipped); continue; }
+      result.created++;
+      if (r.status === 'pending') result.pending++;
+      if (r.status === 'assigned') perWorker.set(s.member_id, (perWorker.get(s.member_id) || 0) + 1);
+    }
+    for (const [mid, n] of perWorker) {
+      notify(mid, `You have ${n} new shift${n > 1 ? 's' : ''} in the week of ${fmtShift({ start: `${to}T00:00`, end: `${to}T00:00` }).split(',')[0]}.`, 'calendar');
+    }
+  });
+  return result;
 }));
 
 group.put('/shifts/:sid', h((req) => {
@@ -401,7 +508,18 @@ group.post('/requests', h((req) => {
   );
   if (dupe) fail(409, 'You already have a pending request for this shift.');
   const message = str(req.body.message, 500);
-  const manager = one("SELECT id FROM members WHERE group_id = ? AND role = 'manager' AND active = 1", req.gid);
+
+  // Change, drop and pick-up requests go to all managers (to_member_id stays empty).
+  if (type === 'pickup') {
+    if (s.status !== 'open' || s.member_id) fail(400, 'Only open shifts can be picked up.');
+    assertFree(req.member.id, s.start, s.end, [s.id], 'You');
+    run(
+      `INSERT INTO requests (group_id, type, shift_id, from_member_id, message) VALUES (?, 'pickup', ?, ?, ?)`,
+      req.gid, s.id, req.member.id, message,
+    );
+    notifyManagers(req.gid, `${req.member.name} asked to pick up the open shift on ${fmtShift(s)}.`);
+    return;
+  }
 
   if (type === 'change' || type === 'drop') {
     if (s.member_id !== req.member.id || s.status !== 'assigned') fail(403, 'You can only request changes to your own shifts.');
@@ -416,9 +534,9 @@ group.post('/requests', h((req) => {
     }
     run(
       `INSERT INTO requests (group_id, type, shift_id, from_member_id, to_member_id, proposed_start, proposed_end, message)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, req.gid, type, s.id, req.member.id, manager?.id ?? null, ps, pe, message,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, req.gid, type, s.id, req.member.id, null, ps, pe, message,
     );
-    notify(manager?.id, type === 'drop'
+    notifyManagers(req.gid, type === 'drop'
       ? `${req.member.name} asked to drop their shift on ${fmtShift(s)}.`
       : `${req.member.name} asked to change their shift on ${fmtShift(s)} to ${fmtShift({ start: ps, end: pe })}.`);
     return;
@@ -466,7 +584,7 @@ group.post('/requests/:rid/respond', h((req) => {
   const s = one('SELECT * FROM shifts WHERE id = ?', r.shift_id);
   if (!s) fail(410, 'The shift no longer exists.');
 
-  const byManager = r.type === 'change' || r.type === 'drop';
+  const byManager = r.type === 'change' || r.type === 'drop' || r.type === 'pickup';
   if (byManager ? !req.isManager : r.to_member_id !== req.member.id) fail(403, 'This request is not yours to answer.');
 
   const close = (status) => run("UPDATE requests SET status = ?, resolved_at = datetime('now') WHERE id = ?", status, r.id);
@@ -487,7 +605,7 @@ group.post('/requests/:rid/respond', h((req) => {
 
     if (!approve) {
       close('declined');
-      const label = r.type === 'trade' ? 'trade request' : r.type === 'drop' ? 'request to drop' : 'request to change';
+      const label = { trade: 'trade request', drop: 'request to drop', change: 'request to change', pickup: 'request to pick up' }[r.type];
       notify(r.from_member_id, `${req.member.name} declined your ${label} for ${fmtShift(s)}.`);
       return;
     }
@@ -498,6 +616,14 @@ group.post('/requests/:rid/respond', h((req) => {
       run("UPDATE shifts SET start = ?, end = ?, updated_at = datetime('now') WHERE id = ?", r.proposed_start, r.proposed_end, s.id);
       close('approved');
       notify(r.from_member_id, `Approved: your shift on ${fmtShift(s)} is now ${fmtShift({ start: r.proposed_start, end: r.proposed_end })}.`, 'calendar');
+    } else if (r.type === 'pickup') {
+      if (s.member_id || s.status !== 'open') fail(409, 'This shift has already been filled.');
+      if (s.start <= nowLocal()) fail(409, 'This shift has already started.');
+      assertFree(r.from_member_id, s.start, s.end, [s.id], who);
+      run("UPDATE shifts SET member_id = ?, status = 'assigned', updated_at = datetime('now') WHERE id = ?", r.from_member_id, s.id);
+      cancelPendingFor(s.id, r.id);
+      close('approved');
+      notify(r.from_member_id, `Approved: the shift on ${fmtShift(s)} is now yours.`, 'calendar');
     } else if (r.type === 'drop') {
       if (s.member_id !== r.from_member_id) fail(409, 'This shift has been reassigned since the request was made.');
       run("UPDATE shifts SET member_id = NULL, status = 'open', updated_at = datetime('now') WHERE id = ?", s.id);
@@ -547,7 +673,7 @@ group.post('/notifications/read', h((req) => {
 group.get('/pulse', h((req) => ({
   unread: one('SELECT COUNT(*) AS n FROM notifications WHERE member_id = ? AND read = 0', req.member.id).n,
   actionable: req.isManager
-    ? one("SELECT COUNT(*) AS n FROM requests WHERE group_id = ? AND status = 'pending' AND type IN ('change','drop')", req.gid).n
+    ? one("SELECT COUNT(*) AS n FROM requests WHERE group_id = ? AND status = 'pending' AND type IN ('change','drop','pickup')", req.gid).n
     : one("SELECT COUNT(*) AS n FROM requests WHERE group_id = ? AND status = 'pending' AND to_member_id = ?", req.gid, req.member.id).n,
   lastMessageId: visibleMessages(req, 'SELECT MAX(id) AS n FROM messages WHERE group_id = ?').n ?? 0,
 })));

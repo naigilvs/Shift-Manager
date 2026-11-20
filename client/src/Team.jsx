@@ -83,12 +83,23 @@ function InviteCard({ ctx }) {
 function MemberList({ ctx }) {
   const [error, setError] = useState('');
   const remove = async (m) => {
-    if (!window.confirm(`Remove ${m.name} from the group? Their upcoming shifts become open shifts.`)) return;
+    const extra = m.role === 'worker' ? ' Their upcoming shifts become open shifts.' : '';
+    if (!window.confirm(`Remove ${m.name} from the group?${extra}`)) return;
     try { await api('DELETE', `/groups/${ctx.gid}/members/${m.id}`); ctx.bump(); } catch (e) { setError(e.message); }
   };
+  const setRole = async (m, role) => {
+    const msg = role === 'manager'
+      ? `Make ${m.name} a co-manager? They'll be able to create and edit shifts, answer requests and read all messages. Managers don't work shifts, so their upcoming shifts become open shifts.`
+      : `Make ${m.name} a worker again? They'll lose manager access.`;
+    if (!window.confirm(msg)) return;
+    setError('');
+    try { await api('PUT', `/groups/${ctx.gid}/members/${m.id}/role`, { role }); ctx.bump(); } catch (e) { setError(e.message); }
+  };
+  const canRemove = (m) => ctx.isManager && !m.isOwner && (m.role === 'worker' || ctx.isOwner);
   return (
     <section className="card">
       <h3>People ({ctx.members.length})</h3>
+      {ctx.isOwner && <p className="muted small">As the owner, you can make people co-managers. Co-managers can do everything you can except change who is a manager.</p>}
       <ErrorBox error={error} />
       <ul className="member-list">
         {ctx.members.map((m) => (
@@ -97,14 +108,21 @@ function MemberList({ ctx }) {
             <div className="member-main">
               <div className="member-name">
                 {m.name}{m.id === ctx.me.id ? ' (you)' : ''}
-                {m.role === 'manager' && <span className="pill">Manager</span>}
+                {m.isOwner ? <span className="pill pill-owner">Owner</span> : m.role === 'manager' && <span className="pill">Co-manager</span>}
                 {!m.joined && <span className="pill pill-warn">Invited</span>}
               </div>
               {m.phone && <div className="muted small">{m.phone}</div>}
               {m.role === 'worker' && <div className="muted small">{summarizeAvailability(m.availability)}</div>}
               {m.availabilityNote && <div className="muted small">“{m.availabilityNote}”</div>}
             </div>
-            {ctx.isManager && m.role !== 'manager' && <button className="btn btn-danger-ghost btn-sm" onClick={() => remove(m)}>Remove</button>}
+            <div className="member-actions">
+              {ctx.isOwner && !m.isOwner && m.joined && (
+                m.role === 'worker'
+                  ? <button className="btn btn-ghost btn-sm" onClick={() => setRole(m, 'manager')}>Make co-manager</button>
+                  : <button className="btn btn-ghost btn-sm" onClick={() => setRole(m, 'worker')}>Make worker</button>
+              )}
+              {canRemove(m) && <button className="btn btn-danger-ghost btn-sm" onClick={() => remove(m)}>Remove</button>}
+            </div>
           </li>
         ))}
       </ul>
